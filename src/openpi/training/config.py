@@ -19,6 +19,7 @@ import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.g1_policy as g1_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -352,6 +353,58 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotG1DataConfig(DataConfigFactory):
+    # G01 three-camera layout: top_head, hand_left, hand_right
+    # state: 20-dim (joints 14 + gripper 2 + head 2 + waist 2)
+    # action: 22-dim (the 20 above + base velocity 2)
+    # To train only dual arms + grippers, crop to 16/16 during data conversion and update delta_action_mask accordingly
+
+    # Mask for absolute joint angles -> delta: True = convert to delta, False = keep absolute
+    # Default: first 14 dims (joints) delta, 2 gripper dims absolute, 2 head dims delta, 2 waist dims delta, 2 base velocity dims absolute
+    use_delta: bool = True
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation.images.top_head",
+                        "observation/left_wrist_image": "observation.images.hand_left",
+                        "observation/right_wrist_image": "observation.images.hand_right",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[g1_policy.G1Inputs(model_type=model_config.model_type)],
+            outputs=[g1_policy.G1Outputs()],
+        )
+
+        if self.use_delta:
+            # The mask only covers the first 20 dims (aligned with state); the 2 velocity dims have no corresponding state and are not converted to delta
+            delta_action_mask = _transforms.make_bool_mask(14, -2, 2, 2)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
         )
 
 
@@ -929,6 +982,30 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=20_000,
+    ),
+    #
+    # Course G1 config (π0.5 fine-tuning on G01 robot data).
+    #
+    TrainConfig(
+        name="pi05_course",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50),
+        data=LeRobotG1DataConfig(
+            repo_id="group1/task15_train",
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        assets_base_dir="./assets",
+        checkpoint_base_dir="./checkpoints",
+        batch_size=2,
+        fsdp_devices=2,
+        num_workers=0,
+        num_train_steps=20,
+        log_interval=1,
+        save_interval=10,
+        wandb_enabled=False,
     ),
     #
     # Debugging configs.
