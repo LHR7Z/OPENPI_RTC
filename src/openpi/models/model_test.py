@@ -1,5 +1,7 @@
 from flax import nnx
 import jax
+import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from openpi.models import model as _model
@@ -37,6 +39,24 @@ def test_pi0_lora_model():
 
     actions = nnx_utils.module_jit(model.sample_actions)(key, obs, num_steps=10)
     assert actions.shape == (batch_size, model.action_horizon, model.action_dim)
+
+
+def test_pi0_rtc_guidance():
+    key = jax.random.key(0)
+    config = pi0_config.Pi0Config(pi05=True, paligemma_variant="dummy", action_expert_variant="dummy")
+    model = config.create(key)
+    obs = config.fake_obs(1)
+    sample = nnx_utils.module_jit(model.sample_actions)
+    noise = jax.random.normal(jax.random.key(1), (1, model.action_horizon, model.action_dim))
+    target = jnp.full_like(noise, 0.5)
+
+    free = sample(key, obs, noise=noise)
+    unweighted = sample(key, obs, noise=noise, prev_chunk=target, guidance_weights=jnp.zeros_like(noise))
+    guided = sample(key, obs, noise=noise, prev_chunk=target, guidance_weights=jnp.ones_like(noise))
+
+    np.testing.assert_allclose(unweighted, free, atol=1e-5)
+    assert guided.shape == free.shape
+    assert jnp.abs(guided - target).mean() < 0.5 * jnp.abs(free - target).mean()
 
 
 def test_pi0_fast_model():

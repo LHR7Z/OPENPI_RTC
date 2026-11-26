@@ -21,6 +21,17 @@ from openpi.shared import nnx_utils
 BasePolicy: TypeAlias = _base_policy.BasePolicy
 
 
+def rtc_step_weights(horizon: int, inference_delay: int, overlap: int) -> np.ndarray:
+    """Real-Time Chunking soft mask: 1 for the first `inference_delay` steps (executed from the previous chunk while
+    inferring), exponentially decaying over the rest of the `overlap` with the previous chunk, 0 afterwards."""
+    if not 0 <= inference_delay <= overlap <= horizon:
+        raise ValueError(f"Need 0 <= inference_delay ({inference_delay}) <= overlap ({overlap}) <= horizon ({horizon})")
+    i = np.arange(horizon)
+    c = (overlap - i) / (overlap - inference_delay + 1)
+    decay = c * np.expm1(c) / np.expm1(1.0)
+    return np.where(i < inference_delay, 1.0, np.where(i < overlap, decay, 0.0)).astype(np.float32)
+
+
 class Policy(BasePolicy):
     def __init__(
         self,
@@ -65,10 +76,49 @@ class Policy(BasePolicy):
             self._rng = rng or jax.random.key(0)
 
     @override
-    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+    def infer(  # type: ignore[misc]
+        self,
+        obs: dict,
+        *,
+        noise: np.ndarray | None = None,
+        prev_actions: np.ndarray | None = None,
+        inference_delay: int = 0,
+        guidance_dim_mask: Sequence[bool] | None = None,
+        max_guidance_weight: float = 5.0,
+    ) -> dict:
+        """Runs inference. Passing `prev_actions` enables Real-Time Chunking guidance.
+
+        Args:
+            prev_actions: The not-yet-executed part of the previous chunk, aligned so that `prev_actions[i]` is the
+                action for the same timestep as the new chunk's step i. Same (unnormalized) space as the policy output.
+            inference_delay: Number of steps that will execute from the previous chunk while this call runs.
+            guidance_dim_mask: Action dims to guide (in robot action space); unlisted/padded dims are left free.
+            max_guidance_weight: Clip on the guidance strength (beta in the RTC paper).
+        """
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
+        if prev_actions is not None:
+            if self._is_pytorch_model:
+                raise NotImplementedError("Real-Time Chunking guidance is only implemented for JAX models.")
+            # Map the previous chunk into model space with the same transforms the training targets went through.
+            inputs["actions"] = np.array(prev_actions, dtype=np.float32)
         inputs = self._input_transform(inputs)
+        rtc_kwargs = {}
+        if prev_actions is not None:
+            target = np.asarray(inputs.pop("actions"), dtype=np.float32)
+            horizon, model_dim = self._model.action_horizon, self._model.action_dim
+            overlap = min(len(target), horizon)
+            padded_target = np.zeros((horizon, model_dim), np.float32)
+            padded_target[:overlap] = target[:overlap]
+            robot_mask = np.ones(np.shape(prev_actions)[-1]) if guidance_dim_mask is None else guidance_dim_mask
+            dim_mask = np.zeros(model_dim, np.float32)
+            dim_mask[: len(robot_mask)] = np.asarray(robot_mask, np.float32)
+            weights = rtc_step_weights(horizon, inference_delay, overlap)[:, None] * dim_mask[None, :]
+            rtc_kwargs = {
+                "prev_chunk": jnp.asarray(padded_target)[None],
+                "guidance_weights": jnp.asarray(weights)[None],
+                "max_guidance_weight": max_guidance_weight,
+            }
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
@@ -79,7 +129,7 @@ class Policy(BasePolicy):
             sample_rng_or_pytorch_device = self._pytorch_device
 
         # Prepare kwargs for sample_actions
-        sample_kwargs = dict(self._sample_kwargs)
+        sample_kwargs = dict(self._sample_kwargs, **rtc_kwargs)
         if noise is not None:
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
 

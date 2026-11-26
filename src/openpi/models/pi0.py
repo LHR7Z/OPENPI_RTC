@@ -221,7 +221,14 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        prev_chunk: at.Float[at.Array, "b ah ad"] | None = None,
+        guidance_weights: at.Float[at.Array, "b ah ad"] | None = None,
+        max_guidance_weight: float | at.Float[at.Array, ""] = 5.0,
     ) -> _model.Actions:
+        """If `prev_chunk` is given, applies Real-Time Chunking guidance (Black et al., 2025): each denoising step is
+        pulled toward `prev_chunk`, weighted per step and dimension by `guidance_weights`."""
+        if (prev_chunk is None) != (guidance_weights is None):
+            raise ValueError("prev_chunk and guidance_weights must be provided together.")
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
@@ -236,8 +243,7 @@ class Pi0(_model.BaseModel):
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
-        def step(carry):
-            x_t, time = carry
+        def velocity(x_t, time):
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
                 observation, x_t, jnp.broadcast_to(time, batch_size)
             )
@@ -266,8 +272,26 @@ class Pi0(_model.BaseModel):
                 adarms_cond=[None, adarms_cond],
             )
             assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            return self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
+        def step(carry):
+            x_t, time = carry
+            if prev_chunk is None:
+                v_t = velocity(x_t, time)
+            else:
+
+                def denoise(x):
+                    v = velocity(x, time)
+                    return x - time * v, v
+
+                x0_hat, vjp_fn, v_t = jax.vjp(denoise, x_t, has_aux=True)
+                (correction,) = vjp_fn(((prev_chunk - x0_hat) * guidance_weights).astype(x0_hat.dtype))
+                # The paper's time is tau = 1 - time and its velocity is -v_t, hence the subtraction below.
+                tau = 1.0 - time
+                guidance = jnp.minimum(
+                    max_guidance_weight, (tau**2 + (1.0 - tau) ** 2) / jnp.maximum(tau * (1.0 - tau), 1e-6)
+                )
+                v_t = v_t - guidance * correction
             return x_t + dt * v_t, time + dt
 
         def cond(carry):

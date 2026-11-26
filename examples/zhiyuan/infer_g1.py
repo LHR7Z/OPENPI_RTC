@@ -5,6 +5,7 @@ delta joint/head/waist actions are converted back to absolute targets by adding 
 and images are letterboxed to 224x224 exactly like training (any input size is accepted).
 
 NPZ keys: base_0_rgb, left_wrist_0_rgb, right_wrist_0_rgb (HxWx3 uint8), state (20,), prompt (str).
+`predict()` also supports Real-Time Chunking guidance toward the previous chunk (`prev_actions`).
 """
 
 import argparse
@@ -12,11 +13,14 @@ from pathlib import Path
 
 import jax.numpy as jnp
 import numpy as np
+from openpi_client import image_tools
+
 from openpi import transforms as T
-from openpi.models import model, pi0_config, tokenizer
+from openpi.models import model
+from openpi.models import pi0_config
+from openpi.models import tokenizer
 from openpi.policies.policy import Policy
 from openpi.shared import normalize
-from openpi_client import image_tools
 
 CAMERAS = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
 STATE_DIM = 20
@@ -24,6 +28,9 @@ ACTION_DIM = 22
 ACTION_HORIZON = 50
 # Must match LeRobotG1DataConfig: make_bool_mask(14, -2, 2, 2) -> joints and head/waist are deltas, grippers absolute.
 DELTA_MASK = np.array([True] * 14 + [False] * 2 + [True] * 4)
+# RTC guides only the active left arm (0-6) and left gripper (14). The other dims barely move in this data, so their
+# quantile ranges are ~1e-4 and any target mismatch would be amplified thousands of times by normalization.
+GUIDANCE_DIM_MASK = np.array([True] * 7 + [False] * 7 + [True] + [False] * 7)
 
 
 def load_policy(checkpoint: Path, asset: str) -> tuple[Policy, dict]:
@@ -33,7 +40,9 @@ def load_policy(checkpoint: Path, asset: str) -> tuple[Policy, dict]:
     policy = Policy(
         config.load(weights),
         transforms=[
-            T.Normalize({"state": stats["state"]}, use_quantiles=True),
+            # Only act when `actions` is present, i.e. when an RTC target is passed; plain inference is unaffected.
+            T.DeltaActions(DELTA_MASK),
+            T.Normalize({"state": stats["state"], "actions": stats["actions"]}, use_quantiles=True),
             T.ResizeImages(224, 224),
             T.TokenizePrompt(tokenizer.PaligemmaTokenizer(200), discrete_state_input=True),
             T.PadStatesAndActions(32),
@@ -42,8 +51,23 @@ def load_policy(checkpoint: Path, asset: str) -> tuple[Policy, dict]:
     return policy, stats
 
 
-def predict(policy: Policy, stats: dict, images: dict, state: np.ndarray, prompt: str) -> np.ndarray:
-    """Returns a (50, 22) chunk of absolute action targets."""
+def predict(
+    policy: Policy,
+    stats: dict,
+    images: dict,
+    state: np.ndarray,
+    prompt: str,
+    *,
+    noise: np.ndarray | None = None,
+    prev_actions: np.ndarray | None = None,
+    inference_delay: int = 0,
+    max_guidance_weight: float = 5.0,
+) -> np.ndarray:
+    """Returns a (50, 22) chunk of absolute action targets.
+
+    For RTC, pass the previous chunk's absolute actions aligned to this chunk's timesteps (e.g. `prev[s:]` if `s`
+    steps of the previous chunk ran before this observation) and the number of steps that execute while inferring.
+    """
     state = np.asarray(state, dtype=np.float32)
     obs = {
         "image": {name: np.asarray(images[name]) for name in CAMERAS},
@@ -51,7 +75,17 @@ def predict(policy: Policy, stats: dict, images: dict, state: np.ndarray, prompt
         "state": state,
         "prompt": prompt,
     }
-    raw = policy.infer(obs)["actions"][:, :ACTION_DIM]
+    # RTC kwargs only exist in this repo's Policy; omit them otherwise so plain inference still runs on upstream openpi
+    # (e.g. in the course docker image).
+    rtc = {}
+    if prev_actions is not None:
+        rtc = {
+            "prev_actions": prev_actions,
+            "inference_delay": inference_delay,
+            "guidance_dim_mask": GUIDANCE_DIM_MASK,
+            "max_guidance_weight": max_guidance_weight,
+        }
+    raw = policy.infer(obs, noise=noise, **rtc)["actions"][:, :ACTION_DIM]
     actions = T.Unnormalize({"actions": stats["actions"]}, use_quantiles=True)({"actions": raw})["actions"]
     actions = np.array(actions, dtype=np.float32)
     actions[:, :STATE_DIM] += np.where(DELTA_MASK, state, 0)
